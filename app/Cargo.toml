@@ -41,6 +41,10 @@ keyring = { version = "=3.6.3", features = ["apple-native"] }
 # ... and to the Windows Credential Manager
 keyring = { version = "=3.6.3", features = ["windows-native"] }
 
+[build-dependencies]
+# build.rs: app icon + version information inside the Windows .exe
+winresource = "=0.1.34"
+
 [profile.release]
 opt-level = 3
 

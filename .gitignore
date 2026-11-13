@@ -1,5 +1,7 @@
 # Rust 빌드 결과물
 /app/target/
+# 설치 파일 (packaging/windows/build-installer.ps1 결과물)
+/app/dist/
 
 # 앱을 처음 만든 빌드 에이전트의 기록물 (소스 아님, 일부는 대용량·개인 정보 포함)
 /agent-session.jsonl
