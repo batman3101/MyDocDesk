@@ -75,7 +75,7 @@ pub fn page_html(title: &str, message: &str, items: &[ShareItem], link: impl Fn(
 
 fn pin_html(title: &str, wrong: bool) -> String {
     format!(
-        "<!doctype html><html lang=ko><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{t}</title><style>{CSS}</style></head><body><div class=wrap><span class=badge>공유 문서</span><h1>{t}</h1><p class=msg>보낸 사람이 알려 준 PIN을 입력해 주세요.</p>{w}<form method=get><input name=pin type=password autofocus placeholder=PIN> <button>열기</button></form></div></body></html>",
+        "<!doctype html><html lang=ko><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{t}</title><style>{CSS}</style></head><body><div class=wrap><span class=badge>공유 문서</span><h1>{t}</h1><p class=msg>보낸 사람이 알려 준 PIN을 입력해 주세요.</p>{w}<form method=post><input name=pin type=password autofocus placeholder=PIN autocomplete=off> <button>열기</button></form></div></body></html>",
         t = esc(title),
         w = if wrong { "<p style='color:#ff6b6b'>PIN이 맞지 않습니다.</p>" } else { "" }
     )
@@ -88,8 +88,22 @@ fn simple_html(title: &str, msg: &str) -> String {
 /// Writes index.html and the files into a new folder; returns the folder.
 pub fn export_folder(parent: &Path, title: &str, message: &str, items: &[ShareItem]) -> Result<PathBuf, String> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
-    let dir = parent.join(format!("공유-{}", stamp));
-    std::fs::create_dir_all(dir.join("files")).map_err(|e| format!("폴더를 만들 수 없습니다: {e}"))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("폴더를 만들 수 없습니다: {e}"))?;
+    // always a folder that didn't exist, so nothing from an earlier export comes along
+    let base = format!("공유-{}", stamp);
+    let mut dir = parent.join(&base);
+    let mut n = 2;
+    loop {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => {
+                dir = parent.join(format!("{base}-{n}"));
+                n += 1;
+            }
+            Err(e) => return Err(format!("폴더를 만들 수 없습니다: {e}")),
+        }
+    }
+    std::fs::create_dir(dir.join("files")).map_err(|e| format!("폴더를 만들 수 없습니다: {e}"))?;
     let mut names = Vec::new();
     for it in items {
         let mut name = it.name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
@@ -143,6 +157,32 @@ impl Drop for LiveShare {
     }
 }
 
+const COOKIE: &str = "mdd_s";
+const MAX_PIN_TRIES: u32 = 5;
+const PIN_BLOCK_SECS: u64 = 300;
+
+/// `application/x-www-form-urlencoded` value: '+' is a space, %XX a byte.
+fn form_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => match s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                Some(v) => {
+                    out.push(v);
+                    i += 2;
+                }
+                None => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn start_live(title: String, message: String, items: Vec<ShareItem>, pin: String, hours: u32) -> Result<LiveShare, String> {
     let server = tiny_http::Server::http("0.0.0.0:0").map_err(|e| format!("공유를 시작하지 못했습니다: {e}"))?;
     let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
@@ -168,20 +208,26 @@ pub fn start_live(title: String, message: String, items: Vec<ShareItem>, pin: St
     };
     std::thread::spawn(move || {
         let prefix = format!("/s/{}/", token);
+        // browsers that typed the right PIN (session cookie), and wrong tries per device
+        let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut tries: std::collections::HashMap<String, (u32, Option<std::time::Instant>)> = std::collections::HashMap::new();
         while !stop.load(Ordering::SeqCst) {
-            let req = match server.recv_timeout(Duration::from_millis(250)) {
+            let mut req = match server.recv_timeout(Duration::from_millis(250)) {
                 Ok(Some(r)) => r,
                 Ok(None) => continue,
                 Err(_) => break,
             };
             let who = req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
             let full = req.url().to_string();
-            let (path, query) = full.split_once('?').unwrap_or((full.as_str(), ""));
-            let given_pin = query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("pin="))
-                .unwrap_or("")
-                .to_string();
+            // the query is ignored: a PIN never travels in the address
+            let path = full.split_once('?').map(|(p, _)| p).unwrap_or(full.as_str()).to_string();
+            let path = path.as_str();
+            let cookie_sid = req
+                .headers()
+                .iter()
+                .filter(|h| h.field.equiv("Cookie"))
+                .flat_map(|h| h.value.as_str().split(';').map(|kv| kv.trim().to_string()).collect::<Vec<_>>())
+                .find_map(|kv| kv.strip_prefix(&format!("{COOKIE}=")).map(String::from));
             let html = |s: String, code: u16| {
                 tiny_http::Response::from_data(s.into_bytes())
                     .with_status_code(code)
@@ -195,18 +241,54 @@ pub fn start_live(title: String, message: String, items: Vec<ShareItem>, pin: St
                 let _ = req.respond(html(simple_html("공유가 끝났습니다", "열람 기간이 지났습니다. 보낸 사람에게 다시 요청해 주세요."), 410));
                 continue;
             }
-            if !pin.is_empty() && given_pin != pin {
-                let _ = req.respond(html(pin_html(&title, !given_pin.is_empty()), 200));
-                continue;
+            if !pin.is_empty() {
+                let signed_in = cookie_sid.as_ref().is_some_and(|s| sessions.contains(s));
+                if *req.method() == tiny_http::Method::Post {
+                    // the PIN form; guessing is limited per device (IP)
+                    let now = std::time::Instant::now();
+                    let entry = tries.entry(who.clone()).or_insert((0, None));
+                    if entry.1.is_some_and(|until| until > now) {
+                        let _ = req.respond(html(simple_html("잠시 뒤에 다시", "PIN을 여러 번 틀려 잠시 막았습니다. 몇 분 뒤에 다시 해 주세요."), 429));
+                        continue;
+                    }
+                    let mut body = String::new();
+                    let _ = std::io::Read::read_to_string(&mut std::io::Read::take(req.as_reader(), 4096), &mut body);
+                    let given = body.split('&').find_map(|kv| kv.strip_prefix("pin=")).map(form_decode).unwrap_or_default();
+                    if given == pin {
+                        *entry = (0, None);
+                        let mut sid = [0u8; 16];
+                        let _ = getrandom::getrandom(&mut sid);
+                        let sid: String = sid.iter().map(|b| format!("{:02x}", b)).collect();
+                        sessions.insert(sid.clone());
+                        let set = format!("{COOKIE}={sid}; Path={prefix}; HttpOnly; SameSite=Strict");
+                        let resp = tiny_http::Response::empty(303)
+                            .with_header(tiny_http::Header::from_bytes(&b"Location"[..], prefix.as_bytes()).unwrap())
+                            .with_header(tiny_http::Header::from_bytes(&b"Set-Cookie"[..], set.as_bytes()).unwrap());
+                        let _ = req.respond(resp);
+                    } else {
+                        entry.0 += 1;
+                        if entry.0 >= MAX_PIN_TRIES {
+                            *entry = (0, Some(now + Duration::from_secs(PIN_BLOCK_SECS)));
+                        }
+                        if let Ok(mut l) = log.lock() {
+                            l.push(format!("{}  {} PIN 틀림", chrono::Local::now().format("%H:%M:%S"), who));
+                        }
+                        let _ = req.respond(html(pin_html(&title, true), 200));
+                    }
+                    continue;
+                }
+                if !signed_in {
+                    let _ = req.respond(html(pin_html(&title, false), 200));
+                    continue;
+                }
             }
             let rest = &path[prefix.len()..];
-            let pin_q = if pin.is_empty() { String::new() } else { format!("?pin={}", pct(&pin)) };
             if rest.is_empty() {
                 visits.fetch_add(1, Ordering::SeqCst);
                 if let Ok(mut l) = log.lock() {
                     l.push(format!("{}  {} 페이지 열람", chrono::Local::now().format("%H:%M:%S"), who));
                 }
-                let page = page_html(&title, &message, &items, |i| format!("{}f/{}{}", prefix, i, pin_q), Some(expires_ms));
+                let page = page_html(&title, &message, &items, |i| format!("{}f/{}", prefix, i), Some(expires_ms));
                 let _ = req.respond(html(page, 200));
             } else if let Some(n) = rest.strip_prefix("f/").and_then(|n| n.parse::<usize>().ok()) {
                 if let Some(it) = items.get(n) {
@@ -235,20 +317,88 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    fn local(live: &LiveShare) -> String {
+        live.url.replace(&lan_ip(), "127.0.0.1")
+    }
+    fn client() -> ureq::Agent {
+        ureq::AgentBuilder::new().redirects(0).build()
+    }
+    /// Sends the PIN form; returns (status, the session cookie if one was given).
+    fn send_pin(url: &str, pin: &str) -> (u16, Option<String>) {
+        let r = match client().post(url).set("Content-Type", "application/x-www-form-urlencoded").send_string(&format!("pin={pin}")) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("{e}"),
+        };
+        let cookie = r.header("Set-Cookie").map(|c| c.split(';').next().unwrap_or("").to_string());
+        (r.status(), cookie)
+    }
+    fn get(url: &str, cookie: Option<&str>) -> (u16, Vec<u8>) {
+        let mut req = client().get(url);
+        if let Some(c) = cookie {
+            req = req.set("Cookie", c);
+        }
+        let r = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("{e}"),
+        };
+        let status = r.status();
+        let mut body = Vec::new();
+        r.into_reader().read_to_end(&mut body).unwrap();
+        (status, body)
+    }
+
     #[test]
     fn live_share_serves_page_pin_and_file() {
         let items = vec![ShareItem { name: "메모.txt".into(), kind: "텍스트".into(), bytes: Arc::new(b"hello".to_vec()) }];
         let live = start_live("테스트".into(), "안녕".into(), items, "1234".into(), 1).unwrap();
-        let url = live.url.replace(&lan_ip(), "127.0.0.1");
-        let page = ureq::get(&url).call().unwrap().into_string().unwrap();
-        assert!(page.contains("PIN"));
-        let page = ureq::get(&format!("{url}?pin=1234")).call().unwrap().into_string().unwrap();
+        let url = local(&live);
+        let (_, page) = get(&url, None);
+        assert!(String::from_utf8_lossy(&page).contains("PIN"));
+        let (code, cookie) = send_pin(&url, "1234");
+        assert_eq!(code, 303, "a right PIN sends the browser back to the page");
+        let cookie = cookie.expect("a session cookie");
+        let (_, page) = get(&url, Some(&cookie));
+        let page = String::from_utf8_lossy(&page).to_string();
         assert!(page.contains("메모.txt"));
-        let mut body = Vec::new();
-        ureq::get(&format!("{url}f/0?pin=1234")).call().unwrap().into_reader().read_to_end(&mut body).unwrap();
+        assert!(!page.contains("1234"), "the PIN is not written into the page or its links");
+        let (_, body) = get(&format!("{url}f/0"), Some(&cookie));
         assert_eq!(body, b"hello");
-        assert!(ureq::get(&url.replace("/s/", "/x/")).call().is_err());
+        assert_eq!(get(&url.replace("/s/", "/x/"), None).0, 404);
         assert_eq!(live.downloads.load(Ordering::SeqCst), 1);
+        live.stop();
+    }
+
+    /// The PIN in the address (old links, browser history, proxies) opens nothing.
+    #[test]
+    fn pin_in_the_address_opens_nothing() {
+        let items = vec![ShareItem { name: "a.txt".into(), kind: "t".into(), bytes: Arc::new(b"SECRET".to_vec()) }];
+        let live = start_live("t".into(), "".into(), items, "1234".into(), 1).unwrap();
+        let url = local(&live);
+        let (_, page) = get(&format!("{url}?pin=1234"), None);
+        assert!(!String::from_utf8_lossy(&page).contains("a.txt"));
+        let (_, body) = get(&format!("{url}f/0?pin=1234"), None);
+        assert_ne!(body, b"SECRET");
+        let (_, body) = get(&format!("{url}f/0"), Some("mdd_s=made-up"));
+        assert_ne!(body, b"SECRET", "a made-up cookie opens nothing");
+        live.stop();
+    }
+
+    /// Guessing is stopped: after 5 wrong PINs the right one is refused for a while.
+    #[test]
+    fn wrong_pins_are_limited() {
+        let items = vec![ShareItem { name: "a.txt".into(), kind: "t".into(), bytes: Arc::new(b"x".to_vec()) }];
+        let live = start_live("t".into(), "".into(), items, "1234".into(), 1).unwrap();
+        let url = local(&live);
+        for _ in 0..5 {
+            let (code, cookie) = send_pin(&url, "0000");
+            assert!(cookie.is_none());
+            assert_eq!(code, 200);
+        }
+        let (code, cookie) = send_pin(&url, "1234");
+        assert_eq!(code, 429, "too many tries");
+        assert!(cookie.is_none());
         live.stop();
     }
 
@@ -262,5 +412,19 @@ mod tests {
         assert!(html.contains("files/a%20b.txt"));
         assert!(out.join("files").join("a b.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audit M-06: every export is a new folder, so files picked before can't come along.
+    #[test]
+    fn each_export_is_a_fresh_folder() {
+        let parent = std::env::temp_dir().join(format!("mdd-export-{}", crate::model::new_id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let item = |n: &str, b: &[u8]| ShareItem { name: n.into(), kind: "text".into(), bytes: Arc::new(b.to_vec()) };
+        let first = export_folder(&parent, "First", "", &[item("secret.txt", b"SECRET")]).unwrap();
+        let second = export_folder(&parent, "Second", "", &[item("public.txt", b"PUBLIC")]).unwrap();
+        assert_ne!(first, second);
+        assert!(!second.join("files").join("secret.txt").exists());
+        assert!(second.join("files").join("public.txt").exists());
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }

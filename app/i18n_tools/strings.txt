@@ -349,7 +349,6 @@ P	PDF 속 그림을 꺼내는 기능이 아직 없음 — 페이지를 그림으
 P	화면
 P	테마
 P	시스템 따라가기
-P	ALMUS WorkBoard와 같은 색·글꼴(Inter, Noto Sans KR)·모서리 규칙을 따릅니다.
 P	정보
 F	MyDocDesk {} · {} · 데이터 폴더 {}
 P	목록

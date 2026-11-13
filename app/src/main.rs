@@ -9,6 +9,7 @@ mod demo;
 mod docparse;
 mod extract;
 mod local;
+mod lock;
 mod model;
 mod pipeline;
 mod rag;

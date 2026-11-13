@@ -16,6 +16,16 @@ pub fn vi() -> bool {
     VI.load(Ordering::Relaxed)
 }
 
+/// Tests that read or change the screen language take turns through this lock,
+/// and each one starts on Korean (the language is one global switch).
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SCREEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let g = SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+    set_vi(false);
+    g
+}
+
 /// The text in the chosen language (unknown text stays Korean).
 pub fn tr(s: &'static str) -> &'static str {
     tr_in(vi(), s)
@@ -364,7 +374,6 @@ pub fn tr_in(to_vi: bool, s: &'static str) -> &'static str {
         "화면" => "Giao diện",
         "테마" => "Chủ đề",
         "시스템 따라가기" => "Theo hệ thống",
-        "ALMUS WorkBoard와 같은 색·글꼴(Inter, Noto Sans KR)·모서리 규칙을 따릅니다." => "Dùng cùng màu · phông chữ (Inter, Noto Sans KR) · quy tắc bo góc với ALMUS WorkBoard.",
         "정보" => "Thông tin",
         "MyDocDesk {} · {} · 데이터 폴더 {}" => "MyDocDesk {} · {} · thư mục dữ liệu {}",
         "목록" => "Danh sách",
@@ -635,6 +644,25 @@ pub fn tr_in(to_vi: bool, s: &'static str) -> &'static str {
         "L4 표 안의 표·차트·그림" => "L4 Bảng lồng · biểu đồ · hình",
         "한국어" => "Tiếng Hàn",
         "언어" => "Ngôn ngữ",
+        "두 번 입력한 번호가 다릅니다. 처음부터 다시 정해 주세요" => "Hai lần nhập không giống nhau. Hãy đặt lại từ đầu",
+        "잠금 번호 정하기" => "Đặt mã khóa",
+        "이 PC에서 MyDocDesk를 열 때 쓸 숫자 4자리를 정하세요" => "Hãy đặt 4 chữ số dùng để mở MyDocDesk trên máy này",
+        "확인을 위해 같은 번호를 한 번 더 입력해 주세요" => "Hãy nhập lại cùng mã số một lần nữa để xác nhận",
+        "지금 쓰는 잠금 번호를 입력하세요" => "Nhập mã khóa đang dùng",
+        "확인되면 새 번호를 정합니다" => "Sau khi xác nhận, bạn sẽ đặt mã mới",
+        "잠금 번호를 입력하세요" => "Nhập mã khóa",
+        "숫자 4자리를 넣으면 바로 열립니다" => "Nhập đủ 4 chữ số là mở ngay",
+        "숫자 4자리" => "4 chữ số",
+        "번호는 이 PC에만 저장됩니다" => "Mã số chỉ được lưu trên máy này",
+        "취소" => "Hủy",
+        "잠금 번호를 정했습니다. 자리를 비울 땐 🔒 잠금 (Ctrl+L)" => "Đã đặt mã khóa. Khi rời máy, bấm 🔒 Khóa (Ctrl+L)",
+        "🔒 잠금" => "🔒 Khóa",
+        "잠금" => "Khóa",
+        "자리를 비울 때 잠급니다 (Ctrl+L)" => "Khóa khi rời máy (Ctrl+L)",
+        "잠금 (로그인)" => "Khóa (đăng nhập)",
+        "앱을 열 때와 잠금을 풀 때 숫자 4자리를 씁니다. 자리를 비울 땐 위쪽의 🔒 잠금 또는 Ctrl+L." => "Dùng 4 chữ số khi mở ứng dụng và khi mở khóa. Khi rời máy, bấm 🔒 Khóa ở phía trên hoặc Ctrl+L.",
+        "잠금 번호 바꾸기" => "Đổi mã khóa",
+        "앞의 가져오기가 끝나면 이어서 가져옵니다" => "Sẽ nhập tiếp sau khi lần nhập trước xong",
         _ => s,
     }
 }
@@ -696,6 +724,7 @@ mod tests {
 
     #[test]
     fn detects_question_language_and_translates() {
+        let _screen = test_lock();
         assert_eq!(detect("전세 보증금은 얼마야?"), Lang::Ko);
         assert_eq!(detect("Tiền đặt cọc thuê nhà là bao nhiêu?"), Lang::Vi);
         assert_eq!(detect("How much is the deposit?"), Lang::Other);
@@ -707,6 +736,17 @@ mod tests {
         assert!(p.system.contains("tiếng Việt"));
         let p = crate::rag::prepare(&crate::model::Settings::default(), &crate::demo::default_agent(), &[], "계약은 언제 끝나?");
         assert!(p.system.contains("한국어로 답하세요"));
+    }
+}
+
+#[cfg(test)]
+mod audit_texts {
+    /// Fixed texts added by the 2026-11-13 audit fixes have a Vietnamese version.
+    #[test]
+    fn audit_fix_texts_have_vietnamese() {
+        for s in ["앞의 가져오기가 끝나면 이어서 가져옵니다", "저장했습니다"] {
+            assert_ne!(super::tr_in(true, s), s, "no Vietnamese for: {s}");
+        }
     }
 }
 

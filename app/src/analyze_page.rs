@@ -91,7 +91,14 @@ impl DeskApp {
     pub(super) fn poll_analyze(&mut self) {
         let Some(rx) = &self.an.rx else { return };
         let mut done = None;
-        while let Ok(m) = rx.try_recv() {
+        let (msgs, gone) = drain(rx);
+        if gone && !msgs.iter().any(|m| matches!(m, Msg::Done(_))) {
+            // the analysis thread ended without its result
+            self.an.rx = None;
+            self.toast(crate::ft!("문서 분석이 중간에 중단되었습니다. 다시 시도해 주세요.", "Phân tích tài liệu bị dừng giữa chừng. Hãy thử lại."), BAD());
+            return;
+        }
+        for m in msgs {
             match m {
                 Msg::Step(s, p, msg) => {
                     self.an.step = s;
@@ -604,5 +611,23 @@ fn preview(ui: &mut egui::Ui, blocks: &[Block]) {
             }
         }
         ui.add_space(6.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An analysis whose thread ended without a result isn't shown as running forever.
+    #[test]
+    fn analysis_that_ends_without_a_result_is_not_left_running() {
+        let mut a = DeskApp::new(crate::Args { screenshot: Some(PathBuf::from("unused.png")), page: None });
+        a.shot = None;
+        let (tx, rx) = channel::<crate::analyze::Msg>();
+        drop(tx);
+        a.an.rx = Some(rx);
+        a.poll_analyze();
+        assert!(a.an.rx.is_none());
+        assert!(a.toast.as_ref().is_some_and(|t| t.0.contains("중단")), "the person is told");
     }
 }

@@ -382,11 +382,23 @@ pub fn chart_text(xml: &str) -> String {
 
 // ---------------- zip-based office formats ----------------
 
-fn read_entry(z: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<Vec<u8>> {
-    let mut f = z.by_name(name).ok()?;
+/// The most one compressed part (a zip entry, an HWP section) may grow to when unpacked.
+pub const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Reads at most `cap` bytes from `r`; more than that is an error (a "zip bomb" or a broken
+/// file), never a silently cut text.
+pub fn read_capped(r: impl Read, cap: u64) -> Result<Vec<u8>, String> {
     let mut b = Vec::new();
-    f.read_to_end(&mut b).ok()?;
-    Some(b)
+    r.take(cap.saturating_add(1)).read_to_end(&mut b).map_err(|e| e.to_string())?;
+    if b.len() as u64 > cap {
+        return Err(format!("압축을 풀면 {} MB를 넘어 읽지 않았습니다", cap / 1024 / 1024));
+    }
+    Ok(b)
+}
+
+fn read_entry(z: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<Vec<u8>> {
+    let f = z.by_name(name).ok()?;
+    read_capped(f, MAX_PART_BYTES).ok()
 }
 
 fn read_str(z: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<String> {
@@ -733,13 +745,17 @@ pub fn hwp(bytes: &[u8]) -> Result<Parsed, String> {
     }
     let flags = u32::from_le_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]);
     let compressed = flags & 1 != 0;
+    let too_big = std::cell::Cell::new(false);
     let inflate = |raw: Vec<u8>| -> Vec<u8> {
         if !compressed {
             return raw;
         }
-        let mut out = Vec::new();
-        match flate2::read::DeflateDecoder::new(&raw[..]).read_to_end(&mut out) {
-            Ok(_) => out,
+        match read_capped(flate2::read::DeflateDecoder::new(&raw[..]), MAX_PART_BYTES) {
+            Ok(out) => out,
+            Err(e) if e.contains("MB") => {
+                too_big.set(true);
+                Vec::new()
+            }
             Err(_) => raw,
         }
     };
@@ -811,6 +827,9 @@ pub fn hwp(bytes: &[u8]) -> Result<Parsed, String> {
     p.tables = cx.tables;
     p.nested = cx.nested;
     p.images = cx.images.max(p.media.len() as u32);
+    if too_big.get() && p.note.is_none() {
+        p.note = Some(format!("압축을 풀면 {} MB를 넘는 구역은 읽지 않았습니다", MAX_PART_BYTES / 1024 / 1024));
+    }
     Ok(p)
 }
 
@@ -925,5 +944,20 @@ mod tests {
         assert!(p.text.contains("성명 | [표: 한글 · 영문]"), "{}", p.text);
         assert!(p.text.trim_end().ends_with("끝"));
         assert_eq!((p.tables, p.nested), (1, 1));
+    }
+
+    /// audit M-10: compressed parts are read up to a limit, not to the end whatever their size.
+    #[test]
+    fn reading_stops_at_the_limit() {
+        let data = vec![0u8; 5000];
+        assert_eq!(read_capped(&data[..], 5000).unwrap().len(), 5000);
+        assert!(read_capped(&data[..], 4999).is_err(), "over the limit is an error, not a cut-off text");
+        // a small deflate stream that grows large
+        use std::io::Write;
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![b'a'; 1_000_000]).unwrap();
+        let packed = enc.finish().unwrap();
+        assert!(packed.len() < 10_000);
+        assert!(read_capped(flate2::read::DeflateDecoder::new(&packed[..]), 100_000).is_err());
     }
 }
