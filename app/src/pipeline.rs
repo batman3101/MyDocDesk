@@ -30,7 +30,7 @@ pub enum Msg {
     Done(Box<ScanResult>),
 }
 
-fn under(path: &str, folder: &str) -> bool {
+pub fn under(path: &str, folder: &str) -> bool {
     let p = path.replace('\\', "/").to_lowercase();
     let mut f = folder.replace('\\', "/").to_lowercase();
     if !f.ends_with('/') {
@@ -78,7 +78,14 @@ pub fn scan(folders: Vec<String>, known: Vec<Known>, store: Store, tx: Option<Se
                         d.id = k.id.clone();
                     }
                     if !store.read_only {
-                        let _ = std::fs::write(store.file_path(&d), &bytes);
+                        if let Err(e) = std::fs::write(store.file_path(&d), &bytes) {
+                            // without its original the document isn't added: it's tried again next scan
+                            run.failed += 1;
+                            if run.errors.len() < 20 {
+                                run.errors.push(format!("{}: 원본 복사 실패: {e}", f.display()));
+                            }
+                            continue;
+                        }
                     }
                     if prev.is_some() {
                         updated.push(d);
@@ -95,10 +102,12 @@ pub fn scan(folders: Vec<String>, known: Vec<Known>, store: Store, tx: Option<Se
             }
         }
     }
-    // files that disappeared from a watched folder that still exists
+    // files that disappeared from a watched folder that still exists. Not being listed isn't
+    // enough (a sub-folder may be unreadable, skipped or over the limit): the file itself must be gone.
     for k in &known {
         let in_live_folder = folders.iter().any(|f| under(&k.path, f) && Path::new(f).is_dir());
-        if in_live_folder && !seen.contains(&k.path.to_lowercase()) {
+        let gone = matches!(std::fs::metadata(&k.path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound);
+        if in_live_folder && !seen.contains(&k.path.to_lowercase()) && gone {
             removed.push(k.id.clone());
         }
     }
@@ -121,7 +130,7 @@ mod tests {
         std::fs::create_dir_all(docs.join("sub")).unwrap();
         let store_dir = root.join("store");
         std::fs::create_dir_all(store_dir.join("files")).unwrap();
-        let store = Store { dir: store_dir, read_only: false };
+        let store = Store::at(store_dir);
         std::fs::write(docs.join("a.txt"), "첫 문서 내용").unwrap();
         std::fs::write(docs.join("sub").join("b.md"), "# 둘째\n내용").unwrap();
         let folder = docs.display().to_string();
@@ -141,6 +150,55 @@ mod tests {
         let r3 = scan(vec![folder], known, store, None);
         assert_eq!((r3.run.added, r3.run.updated, r3.run.removed), (1, 1, 1));
         assert!(r3.updated[0].text.contains("바뀌었습니다"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn temp(name: &str) -> (std::path::PathBuf, std::path::PathBuf, Store) {
+        let root = std::env::temp_dir().join(format!("mdd-pipe-{name}-{}", new_id()));
+        let docs = root.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(root.join("store").join("files")).unwrap();
+        (root.clone(), docs, Store::at(root.join("store")))
+    }
+    fn known_of(d: &Document) -> Known {
+        Known { id: d.id.clone(), path: d.source_path.clone(), mtime: d.source_mtime, size: d.size_bytes }
+    }
+
+    /// audit H-04: a file the scan didn't list (skipped, unreadable sub-folder, over a limit)
+    /// is only "removed" when it is really gone.
+    #[test]
+    fn files_not_listed_but_still_there_are_not_removed() {
+        let (root, docs, store) = temp("partial");
+        std::fs::create_dir_all(docs.join(".private")).unwrap(); // the scan skips hidden folders
+        let deep = docs.join("1").join("2").join("3").join("4").join("5").join("6").join("7").join("8");
+        std::fs::create_dir_all(&deep).unwrap(); // and goes only so deep
+        let hidden = docs.join(".private").join("a.txt");
+        let too_deep = deep.join("b.txt");
+        let gone = docs.join("gone.txt");
+        for p in [&hidden, &too_deep, &gone] {
+            std::fs::write(p, "내용").unwrap();
+        }
+        let known: Vec<Known> = [&hidden, &too_deep, &gone]
+            .iter()
+            .map(|p| known_of(&crate::extract::document_from_file(p).unwrap().0))
+            .collect();
+        std::fs::remove_file(&gone).unwrap();
+        let r = scan(vec![docs.display().to_string()], known.clone(), store, None);
+        assert_eq!(r.removed, vec![known[2].id.clone()], "only the file that is really gone");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// audit M-02: when the original can't be copied, the document is a failure, not an addition.
+    #[test]
+    fn original_copy_failure_is_counted_as_failure() {
+        let (root, docs, _) = temp("copyfail");
+        std::fs::write(docs.join("a.txt"), "내용").unwrap();
+        let store = Store::at(root.join("store-without-files"));
+        let r = scan(vec![docs.display().to_string()], vec![], store, None);
+        assert_eq!(r.run.added, 0);
+        assert!(r.added.is_empty());
+        assert_eq!(r.run.failed, 1);
+        assert!(!r.run.errors.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

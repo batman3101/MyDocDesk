@@ -24,6 +24,11 @@ mod pipeline_page;
 mod eval_ai;
 #[path = "ai_page.rs"]
 mod ai_page;
+#[path = "lock_page.rs"]
+mod lock_page;
+#[cfg(test)]
+#[path = "e2e_tests.rs"]
+mod e2e_tests;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -112,7 +117,7 @@ impl Page {
     }
     fn from_name(s: &str) -> Option<Page> {
         Some(match s {
-            "home" => Page::Home,
+            "home" | "lock" | "lock-setup" => Page::Home,
             "library" => Page::Library,
             "analyze" | "analyze-setup" | "analyze-running" => Page::Analyze,
             "pipeline" => Page::Pipeline,
@@ -126,6 +131,19 @@ impl Page {
             "settings" => Page::Settings,
             _ => return None,
         })
+    }
+}
+
+/// Everything a background job has sent so far, and whether the job is gone (its thread ended,
+/// normally after its last message, or because it crashed).
+fn drain<T>(rx: &Receiver<T>) -> (Vec<T>, bool) {
+    let mut got = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(m) => got.push(m),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return (got, false),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return (got, true),
+        }
     }
 }
 
@@ -207,22 +225,39 @@ pub struct DeskApp {
     kw_rx: Option<Receiver<(String, AskResult)>>,
     ask_docs: Vec<String>,
     ask_doc_filter: String,
+    /// The 4-digit lock that works as the login.
+    lock: crate::lock::Lock,
+    /// The last save failure (shown once; cleared when a save works again).
+    save_error: Option<String>,
+    /// Connect the remembered sync account once the lock is opened (not before).
+    connect_after_unlock: bool,
+    /// Files dropped while an import was running: imported right after it.
+    import_queue: Vec<PathBuf>,
 }
 
 impl DeskApp {
     pub fn new(args: Args) -> Self {
         let demo_mode = args.screenshot.is_some();
         let store = if demo_mode { Store::demo() } else { Store::open() };
+        let mut store = store;
+        let mut load_warnings: Vec<String> = Vec::new();
         let (lib, settings) = if demo_mode {
             let s = Settings { provider: Provider::Ollama, device_name: "내 PC".into(), theme: if std::env::var("MDD_THEME").as_deref() == Ok("dark") { "dark".into() } else { "light".into() }, language: if std::env::var("MDD_LANG").as_deref() == Ok("vi") { "vi".into() } else { "ko".into() }, ..Default::default() };
             (demo::demo(), s)
         } else {
-            let first = store.load_settings().is_none();
-            let mut lib = store.load_library();
-            if first && lib.docs.is_empty() {
+            let ls = store.load_settings();
+            let ll = store.load_library();
+            load_warnings.extend(ls.warning.clone());
+            load_warnings.extend(ll.warning.clone());
+            if ls.block_writes || ll.block_writes {
+                store.read_only = true;
+            }
+            let first = ls.value.is_none() && ls.warning.is_none();
+            let mut lib = ll.value.unwrap_or_default();
+            if first && lib.docs.is_empty() && ll.warning.is_none() {
                 lib = demo::welcome();
             }
-            (lib, store.load_settings().unwrap_or_default())
+            (lib, ls.value.unwrap_or_default())
         };
         let page = args.page.as_deref().and_then(Page::from_name).unwrap_or(Page::Home);
         let args_page = args.page.clone();
@@ -287,7 +322,15 @@ impl DeskApp {
             kw_rx: None,
             ask_docs: Vec::new(),
             ask_doc_filter: String::new(),
+            lock: crate::lock::Lock::open(),
+            save_error: None,
+            connect_after_unlock: false,
+            import_queue: Vec::new(),
         };
+        // demo / screenshots never lock; a real start asks for the number (or to pick one)
+        if !demo_mode {
+            app.lock = crate::lock::Lock::starting(&app.settings.lock_pin);
+        }
         app.agent_sel = app.lib.live_agents().next().map(|(_, a)| a.id.clone()).unwrap_or_default();
         app.selected_doc = app.lib.live_docs().nth(if demo_mode { 2 } else { 0 }).map(|(_, d)| d.id.clone());
         if demo_mode {
@@ -317,6 +360,12 @@ impl DeskApp {
                 k += 1;
             }
             match args_page.as_deref() {
+                // screenshots of the lock screen (demo store: nothing is saved)
+                Some("lock") => {
+                    app.settings.lock_pin = crate::lock::hash_pin("1234");
+                    app.lock = crate::lock::Lock::starting(&app.settings.lock_pin);
+                }
+                Some("lock-setup") => app.lock = crate::lock::Lock::starting(""),
                 Some("analyze-setup") => {}
                 Some("analyze-running") => {
                     let (tx, rx) = channel();
@@ -340,9 +389,11 @@ impl DeskApp {
         if !demo_mode {
             app.start_ai_detect();
         }
+        if !load_warnings.is_empty() {
+            app.toast(load_warnings.join("\n"), BAD());
+        }
         if !demo_mode && app.settings.remember_pass && !app.settings.saved_pass.is_empty() && !app.settings.local_only {
-            app.pass_input = app.settings.saved_pass.clone();
-            app.connect_account();
+            app.connect_after_unlock = true; // after the 4-digit lock, not before
         }
         app
     }
@@ -369,27 +420,56 @@ impl DeskApp {
         }
     }
 
-    fn save_now(&mut self) {
+    /// Saves what changed. A part that fails stays marked as changed, so the 1-second timer
+    /// tries again until it works; the failure is shown once (not every second).
+    fn save_now(&mut self) -> Result<(), String> {
+        let mut failed: Option<String> = None;
         if self.lib_dirty {
-            if let Err(e) = self.store.save_library(&self.lib) {
-                self.toast(crate::ft!("저장하지 못했습니다: {e}", "Không lưu được: {e}", e = e), BAD());
+            match self.store.save_library(&self.lib) {
+                Ok(()) => self.lib_dirty = false,
+                Err(e) => failed = Some(e),
             }
-            self.lib_dirty = false;
         }
         if self.settings_dirty {
             let mut s = self.settings.clone();
             if !s.remember_pass {
                 s.saved_pass.clear();
             }
-            let _ = self.store.save_settings(&s);
-            self.settings_dirty = false;
+            match self.store.save_settings(&s) {
+                Ok(()) => self.settings_dirty = false,
+                Err(e) => failed = Some(match failed {
+                    Some(f) => format!("{f} / {e}"),
+                    None => e,
+                }),
+            }
         }
         self.last_save = Instant::now();
+        match failed {
+            Some(e) => {
+                if self.save_error.as_deref() != Some(e.as_str()) {
+                    self.toast(crate::ft!("저장하지 못했습니다 (자동으로 다시 시도합니다): {e}", "Không lưu được (sẽ tự thử lại): {e}", e = e), BAD());
+                }
+                self.save_error = Some(e.clone());
+                Err(e)
+            }
+            None => {
+                if self.save_error.take().is_some() {
+                    self.toast(crate::i18n::tr("저장했습니다"), GOOD());
+                }
+                Ok(())
+            }
+        }
     }
 
     // ---------- import ----------
 
     fn import_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.import_rx.is_some() {
+            // one import at a time: these follow when the running one is done
+            self.import_queue.extend(paths);
+            self.toast(crate::i18n::tr("앞의 가져오기가 끝나면 이어서 가져옵니다"), ACCENT());
+            return;
+        }
         let mut files = Vec::new();
         for p in paths {
             if p.is_dir() {
@@ -470,11 +550,24 @@ impl DeskApp {
     fn poll_import(&mut self) {
         let Some(rx) = &self.import_rx else { return };
         let mut done = None;
-        while let Ok(m) = rx.try_recv() {
+        let (msgs, gone) = drain(rx);
+        for m in msgs {
             match m {
                 ImportMsg::Progress(s) => self.import_status = s,
                 ImportMsg::Done(r, u) => done = Some((r, u)),
             }
+        }
+        if done.is_none() && gone {
+            // the reading thread ended without its result: not "importing" any more
+            self.import_rx = None;
+            self.importing = 0;
+            self.import_status.clear();
+            self.toast(crate::ft!("가져오기가 중간에 중단되었습니다. 다시 시도해 주세요.", "Việc nhập bị dừng giữa chừng. Hãy thử lại."), BAD());
+            if !self.import_queue.is_empty() {
+                let next = std::mem::take(&mut self.import_queue);
+                self.import_paths(next);
+            }
+            return;
         }
         if let Some((results, usage)) = done {
             self.lib.usage.extend(usage);
@@ -485,7 +578,15 @@ impl DeskApp {
             for r in results {
                 match r {
                     Ok(d) => {
-                        let dup = self.lib.live_docs().any(|(_, x)| x.file_name == d.file_name && x.size_bytes == d.size_bytes);
+                        // the same content is a duplicate (by the original's sha; older documents
+                        // without one: same name, size and text)
+                        let dup = self.lib.live_docs().any(|(_, x)| {
+                            if crate::model::is_sha(&x.file_sha) && crate::model::is_sha(&d.file_sha) {
+                                x.file_sha == d.file_sha
+                            } else {
+                                x.file_name == d.file_name && x.size_bytes == d.size_bytes && x.text == d.text
+                            }
+                        });
                         if dup {
                             let _ = std::fs::remove_file(self.store.file_path(&d));
                             skipped += 1;
@@ -510,6 +611,10 @@ impl DeskApp {
                 msg.push_str(&crate::ft!(" · 실패 {}개: {}", " · lỗi {}: {}", errs.len(), errs[0]));
             }
             self.toast(msg, if errs.is_empty() { GOOD() } else { WARN() });
+            if !self.import_queue.is_empty() {
+                let next = std::mem::take(&mut self.import_queue);
+                self.import_paths(next);
+            }
         }
     }
 
@@ -755,7 +860,8 @@ impl DeskApp {
             return;
         }
         let device = self.settings.device_name.clone();
-        match sync::sync(&acc, &mut self.lib, &self.store, &device) {
+        let device_id = self.settings.device_id.clone();
+        match sync::sync(&acc, &mut self.lib, &self.store, &device, &device_id) {
             Ok(r) => {
                 self.settings.last_sync_ms = now_ms();
                 self.settings_dirty = true;
@@ -765,6 +871,12 @@ impl DeskApp {
                     r.pushed_files,
                     r.pulled_files,
                     if r.new_account { crate::i18n::tr(" (처음 올림)") } else { "" });
+                if r.unreadable > 0 {
+                    self.sync_msg.push_str(&crate::ft!(" · 읽지 못한 동기화 파일 {}개는 건너뜀", " · bỏ qua {} tệp đồng bộ không đọc được", r.unreadable));
+                }
+                if r.cleanup_failed > 0 {
+                    self.sync_msg.push_str(&crate::ft!(" · 지운 문서의 원본 {}개를 아직 못 지움 (다음에 다시 시도)", " · chưa xóa được {} bản gốc của tài liệu đã xóa (sẽ thử lại)", r.cleanup_failed));
+                }
                 self.toast(crate::i18n::tr("동기화했습니다"), GOOD());
             }
             Err(e) => {
@@ -837,7 +949,6 @@ impl eframe::App for DeskApp {
         self.poll_scan();
         self.poll_ai_conn();
         self.poll_eval_ai();
-        self.auto_scan_tick();
         if let Some(rx) = &self.test_rx {
             if let Ok(r) = rx.try_recv() {
                 self.test_msg = match r {
@@ -850,6 +961,30 @@ impl eframe::App for DeskApp {
         if self.kw_rx.is_some() || self.aic.rx.is_some() || self.aic.models_rx.is_some() || self.aic.start_rx.is_some() || self.pipe.rx.is_some() || self.eval_rx.is_some() || self.an.rx.is_some() || self.import_rx.is_some() || self.ask_rx.is_some() || self.test_rx.is_some() || self.live.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
+
+        // locked: only the lock screen; dropped files and auto sync wait until it opens
+        if self.lock.is_locked() {
+            crate::i18n::set_vi(self.settings.language == "vi");
+            self.sync_theme(ctx);
+            self.lock_screen(ctx);
+            if self.last_save.elapsed() > Duration::from_secs(1) && (self.lib_dirty || self.settings_dirty) {
+                let _ = self.save_now(); // a failure stays dirty and is retried
+            }
+            return;
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::L)) {
+            self.lock_now();
+            return;
+        }
+        // work that starts by itself waits for the lock to be opened
+        if self.connect_after_unlock {
+            self.connect_after_unlock = false;
+            if self.pass_input.is_empty() {
+                self.pass_input = self.settings.saved_pass.clone();
+            }
+            self.connect_account();
+        }
+        self.auto_scan_tick();
 
         // files dropped onto the window
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
@@ -906,7 +1041,7 @@ impl eframe::App for DeskApp {
         self.toast_area(ctx);
 
         if self.last_save.elapsed() > Duration::from_secs(1) && (self.lib_dirty || self.settings_dirty) {
-            self.save_now();
+            let _ = self.save_now(); // a failure stays dirty and is retried
         }
     }
 
@@ -918,11 +1053,16 @@ impl eframe::App for DeskApp {
         if let Some(l) = &self.live {
             l.stop();
         }
-        self.save_now();
+        let _ = self.save_now();
     }
 }
 
 // ================= drawing =================
+
+/// Menu buttons are painted by hand, so they say what they are for screen readers and E2E tests.
+fn nav_a11y(resp: &egui::Response, p: Page, selected: bool) {
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, p.label()));
+}
 
 fn kind_color(kind: &str) -> Color32 {
     match kind {
@@ -1040,6 +1180,21 @@ impl DeskApp {
                             });
                         });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // lock (stepping away): the 4-digit number opens it again
+                        {
+                            let g = ui.painter().layout_no_wrap(crate::i18n::tr("🔒 잠금").into(), FontId::proportional(12.5), TEXT2());
+                            let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 20.0, 28.0), Sense::click());
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::i18n::tr("잠금")));
+                            ui.painter().rect(r, CornerRadius::same(4), if resp.hovered() { theme::HOVER() } else { CARD() }, Stroke::new(1.0, LINE2()), egui::StrokeKind::Inside);
+                            ui.painter().galley(r.center() - g.size() / 2.0, g, TEXT2());
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.on_hover_text(crate::i18n::tr("자리를 비울 때 잠급니다 (Ctrl+L)")).clicked() {
+                                self.lock_now();
+                            }
+                            ui.add_space(8.0);
+                        }
                         // light / dark segment (like the KO | VI switch)
                         let dark = theme::is_dark();
                         let mut pick: Option<&str> = None;
@@ -1162,13 +1317,17 @@ impl DeskApp {
                 let (top, bottom): (Vec<Page>, Vec<Page>) = Page::ALL.iter().partition(|p| !matches!(p, Page::AiConnect | Page::Sync | Page::Settings));
                 for p in top {
                     let busy = (p == Page::Share && self.live.is_some()) || (p == Page::Pipeline && self.pipe.rx.is_some());
-                    if item(ui, p.icon(), p.short(), self.page == p, busy).on_hover_text(p.label()).clicked() {
+                    let r = item(ui, p.icon(), p.short(), self.page == p, busy);
+                    nav_a11y(&r, p, self.page == p);
+                    if r.on_hover_text(p.label()).clicked() {
                         self.page = p;
                     }
                 }
                 ui.add_space((ui.available_height() - 3.0 * 52.0).max(4.0));
                 for p in bottom {
-                    if item(ui, p.icon(), p.short(), self.page == p, false).on_hover_text(p.label()).clicked() {
+                    let r = item(ui, p.icon(), p.short(), self.page == p, false);
+                    nav_a11y(&r, p, self.page == p);
+                    if r.on_hover_text(p.label()).clicked() {
                         self.page = p;
                     }
                 }
@@ -1195,6 +1354,7 @@ impl DeskApp {
                     }
                     let selected = self.page == *p;
                     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+                    nav_a11y(&resp, *p, selected);
                     let painter = ui.painter();
                     if selected {
                         painter.rect_filled(rect, CornerRadius::same(4), ACCENT_SOFT());
@@ -2616,6 +2776,16 @@ impl DeskApp {
             ui.add_space(6.0);
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                ui.label(bold(crate::i18n::tr("잠금 (로그인)"), 16.0));
+                ui.label(muted(crate::i18n::tr("앱을 열 때와 잠금을 풀 때 숫자 4자리를 씁니다. 자리를 비울 땐 위쪽의 🔒 잠금 또는 Ctrl+L.")));
+                ui.add_space(4.0);
+                if ui.button(crate::i18n::tr("잠금 번호 바꾸기")).clicked() {
+                    self.begin_pin_change();
+                }
+            });
+            ui.add_space(6.0);
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.label(bold(crate::i18n::tr("화면"), 16.0));
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(crate::i18n::tr("테마")).color(TEXT2()));
@@ -2636,7 +2806,6 @@ impl DeskApp {
                         }
                     }
                 });
-                ui.label(muted(crate::i18n::tr("ALMUS WorkBoard와 같은 색·글꼴(Inter, Noto Sans KR)·모서리 규칙을 따릅니다.")));
                 ui.add_space(8.0);
                 ui.label(bold(crate::i18n::tr("정보"), 16.0));
                 ui.label(muted(crate::ft!("MyDocDesk {} · {} · 데이터 폴더 {}", "MyDocDesk {} · {} · thư mục dữ liệu {}", env!("CARGO_PKG_VERSION"), os_name(), self.store.dir.display())));

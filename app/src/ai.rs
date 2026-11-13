@@ -56,7 +56,12 @@ fn http_err(e: ureq::Error) -> String {
 }
 
 fn blocked(settings: &Settings) -> Option<String> {
-    (settings.local_only && settings.provider.is_cloud())
+    blocked_for(settings, settings.provider)
+}
+
+/// "This PC only" stops every request to a cloud service (subscriptions and APIs), whatever it is for.
+fn blocked_for(settings: &Settings, p: Provider) -> Option<String> {
+    (settings.local_only && p.is_cloud())
         .then(|| crate::i18n::tr("'내 PC 전용 모드'가 켜져 있어 클라우드 AI(구독·API)로 보내지 않았습니다. '계정·동기화'에서 끄거나 내 PC의 AI를 고르세요.").into())
 }
 
@@ -150,6 +155,9 @@ pub fn cost(settings: &Settings, p: u64, c: u64) -> f64 {
 /// The models a service offers right now. Local AI and APIs are asked live; subscriptions
 /// can't be listed, so their usual names are offered (any other name can be typed in).
 pub fn list_models(settings: &Settings, p: Provider) -> Result<Vec<String>, String> {
+    if let Some(e) = blocked_for(settings, p) {
+        return Err(e);
+    }
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
     let key = settings.key_for(p);
     let mut out: Vec<String> = match p.route() {
@@ -270,4 +278,28 @@ pub fn describe_image(settings: &Settings, mime: &str, bytes: &[u8]) -> Result<A
         (v["usage"]["prompt_tokens"].as_u64(), v["usage"]["completion_tokens"].as_u64())
     };
     Ok(AiReply { prompt_tokens: pt.unwrap_or(800), completion_tokens: ct.unwrap_or_else(|| estimate_tokens(&text)), text, model })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// audit M-07: with "this PC only" on, not even the model list is asked from a cloud service.
+    #[test]
+    fn local_only_sends_no_model_list_request() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let s = Settings { provider: Provider::OpenAi, base_url: format!("http://{}", server.server_addr()), api_key: "test-dummy".into(), ..Default::default() };
+        assert!(s.local_only);
+        let r = list_models(&s, Provider::OpenAi);
+        assert!(r.is_err(), "refused: {r:?}");
+        assert!(server.recv_timeout(Duration::from_millis(300)).unwrap().is_none(), "no request reached the service");
+        // local AI is still listed (it doesn't leave this PC)
+        let local = Settings { provider: Provider::Ollama, base_url: format!("http://{}", server.server_addr()), ..Default::default() };
+        let h = std::thread::spawn(move || {
+            let req = server.recv_timeout(Duration::from_secs(5)).unwrap().expect("local request");
+            let _ = req.respond(tiny_http::Response::from_string(r#"{"data":[{"id":"llama"}]}"#).with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap()));
+        });
+        assert_eq!(list_models(&local, Provider::Ollama).unwrap(), vec!["llama"]);
+        h.join().unwrap();
+    }
 }

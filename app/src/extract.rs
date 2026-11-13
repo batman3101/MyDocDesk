@@ -198,6 +198,10 @@ pub fn kind_label(ext: &str) -> String {
 /// Reads one file into a new document. The caller copies the original file and may
 /// add AI descriptions of the returned pictures.
 pub fn document_from_file(path: &Path) -> Result<(Document, Vec<u8>, Vec<docparse::Media>), String> {
+    let size = std::fs::metadata(path).map_err(|e| format!("파일을 열 수 없습니다: {e}"))?.len();
+    if size > MAX_FILE_BYTES {
+        return Err(format!("파일이 너무 큽니다 ({} MB 넘음)", MAX_FILE_BYTES / 1024 / 1024));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("파일을 열 수 없습니다: {e}"))?;
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let p = extract(&bytes, &ext)?;
@@ -211,6 +215,7 @@ pub fn document_from_file(path: &Path) -> Result<(Document, Vec<u8>, Vec<docpars
     d.parse_note = p.note.unwrap_or_default();
     d.source_path = path.display().to_string();
     d.source_mtime = file_mtime(path);
+    d.file_sha = crate::model::sha256_hex(&bytes);
     rescore(&mut d);
     Ok((d, bytes, p.media))
 }
@@ -250,13 +255,21 @@ pub fn make_doc(title: String, file_name: String, ext: &str, text: String, size:
     }
 }
 
+/// At most this many files are collected from the folders given at once.
+pub const MAX_FILES: usize = 2000;
+/// Files bigger than this are not read.
+pub const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
+
 /// Every supported file under a folder (depth-limited).
 pub fn collect_folder(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
-    if depth > 6 || out.len() > 2000 {
+    if depth > 6 || out.len() >= MAX_FILES {
         return;
     }
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
+            if out.len() >= MAX_FILES {
+                return;
+            }
             let p = e.path();
             if p.is_dir() {
                 let hidden = p.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(true);
@@ -267,5 +280,37 @@ pub fn collect_folder(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: usiz
                 out.push(p);
             }
         }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// audit M-10: the 2000-file limit holds inside a single folder too.
+    #[test]
+    fn collecting_stops_at_the_file_limit() {
+        let root = std::env::temp_dir().join(format!("mdd-cap-{}", new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..(MAX_FILES + 5) {
+            std::fs::write(root.join(format!("{i:04}.txt")), b"x").unwrap();
+        }
+        let mut found = Vec::new();
+        collect_folder(&root, &mut found, 0);
+        assert_eq!(found.len(), MAX_FILES);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// audit M-10: a file bigger than the limit is refused before it is read into memory.
+    #[test]
+    fn oversized_file_is_refused() {
+        let root = std::env::temp_dir().join(format!("mdd-big-{}", new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let p = root.join("big.txt");
+        std::fs::File::create(&p).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap();
+        let err = document_from_file(&p).err().expect("refused");
+        assert!(err.contains("너무 큽니다"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -54,43 +54,79 @@ impl DeskApp {
     pub(super) fn poll_scan(&mut self) {
         let Some(rx) = &self.pipe.rx else { return };
         let mut done = None;
-        while let Ok(m) = rx.try_recv() {
+        let (msgs, gone) = drain(rx);
+        for m in msgs {
             match m {
                 Msg::Progress(s) => self.pipe.msg = s,
                 Msg::Done(r) => done = Some(r),
             }
         }
+        if done.is_none() && gone {
+            // the scan thread ended without its result: record it, don't stay "collecting"
+            self.pipe.rx = None;
+            self.pipe.msg.clear();
+            let why = crate::ft!("수집 작업이 결과 없이 중단되었습니다", "Việc thu thập bị dừng mà không có kết quả");
+            self.settings.runs.insert(0, PipelineRun { ms: now_ms(), folders: self.settings.watch_folders.len(), failed: 1, errors: vec![why.clone()], ..Default::default() });
+            self.settings.runs.truncate(30);
+            self.settings_dirty = true;
+            self.toast(why, BAD());
+            return;
+        }
         let Some(r) = done else { return };
         self.pipe.rx = None;
-        let r = *r;
+        let mut r = *r;
+        // The result describes the library as it was when the scan started. What the person did
+        // meanwhile wins: deleted documents stay deleted, disconnected folders add nothing.
+        let watched = |p: &str, folders: &[String]| folders.iter().any(|f| pipeline::under(p, f));
+        let (mut n_upd, mut n_rem, mut n_add) = (0, 0, 0);
         for u in r.updated {
-            if let Some(d) = self.lib.docs.iter_mut().find(|d| d.id == u.id) {
+            if let Some(d) = self.lib.docs.iter_mut().find(|d| d.id == u.id && !d.deleted) {
                 let (title, tags, added) = (d.title.clone(), d.tags.clone(), d.added_ms);
                 *d = u;
                 d.title = title;
                 d.tags = tags;
                 d.added_ms = added;
                 d.updated_ms = now_ms();
+                n_upd += 1;
             }
         }
         for id in &r.removed {
-            if let Some(d) = self.lib.docs.iter_mut().find(|d| &d.id == id) {
+            if let Some(d) = self.lib.docs.iter_mut().find(|d| &d.id == id && !d.deleted) {
                 d.deleted = true;
                 d.text.clear();
                 d.updated_ms = now_ms();
                 let _ = std::fs::remove_file(self.store.file_path(d));
+                n_rem += 1;
             }
         }
-        self.lib.docs.extend(r.added);
-        let changed = r.run.added + r.run.updated + r.run.removed;
-        if changed > 0 {
+        for d in r.added {
+            let have = self.lib.live_docs().any(|(_, x)| !x.source_path.is_empty() && x.source_path.eq_ignore_ascii_case(&d.source_path));
+            if have || !watched(&d.source_path, &self.settings.watch_folders) {
+                let _ = std::fs::remove_file(self.store.file_path(&d));
+                continue;
+            }
+            self.lib.docs.push(d);
+            n_add += 1;
+        }
+        r.run.added = n_add;
+        r.run.updated = n_upd;
+        r.run.removed = n_rem;
+        if n_add + n_upd + n_rem > 0 {
             self.touch_lib();
-            self.toast(crate::ft!("자동 수집: 새 문서 {} · 바뀐 문서 {} · 지운 문서 {}", "Tự động thu thập: {} mới · {} đã đổi · {} đã xóa", r.run.added, r.run.updated, r.run.removed), GOOD());
+            self.toast(crate::ft!("자동 수집: 새 문서 {} · 바뀐 문서 {} · 지운 문서 {}", "Tự động thu thập: {} mới · {} đã đổi · {} đã xóa", n_add, n_upd, n_rem), GOOD());
         }
         self.settings.runs.insert(0, r.run);
         self.settings.runs.truncate(30);
         self.settings_dirty = true;
         self.pipe.msg.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn deliver_scan(&mut self, r: pipeline::ScanResult) {
+        let (tx, rx) = channel();
+        tx.send(Msg::Done(Box::new(r))).unwrap();
+        self.pipe.rx = Some(rx);
+        self.poll_scan();
     }
 
     pub(super) fn page_pipeline(&mut self, ui: &mut egui::Ui) {
@@ -241,5 +277,60 @@ impl DeskApp {
                 });
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> DeskApp {
+        let mut a = DeskApp::new(crate::Args { screenshot: Some(PathBuf::from("unused.png")), page: None });
+        a.shot = None;
+        a.lib = Library::default();
+        a.settings.watch_folders = vec!["D:\\docs".into()];
+        a
+    }
+    fn doc(id: &str, path: &str) -> Document {
+        Document { id: id.into(), title: id.into(), text: "본문".into(), source_path: path.into(), has_file: true, ..Default::default() }
+    }
+
+    /// audit M-03: deleting a document while a scan runs is not undone by that scan's result.
+    #[test]
+    fn late_scan_result_does_not_bring_back_a_deleted_document() {
+        let mut a = app();
+        let mut d = doc("x", "D:\\docs\\a.txt");
+        d.deleted = true;
+        d.text.clear();
+        a.lib.docs.push(d);
+        let mut changed = doc("x", "D:\\docs\\a.txt");
+        changed.text = "스캔이 읽은 내용".into();
+        a.deliver_scan(pipeline::ScanResult { added: vec![], updated: vec![changed], removed: vec![], run: Default::default() });
+        assert!(a.lib.docs[0].deleted, "still deleted");
+        assert!(a.lib.docs[0].text.is_empty());
+    }
+
+    /// audit M-03: files from a folder disconnected during the scan, and files already in the
+    /// library, are not added.
+    #[test]
+    fn late_scan_result_skips_disconnected_folders_and_duplicates() {
+        let mut a = app();
+        a.lib.docs.push(doc("have", "D:\\docs\\have.txt"));
+        let added = vec![doc("n1", "E:\\old\\new.txt"), doc("n2", "D:\\docs\\have.txt"), doc("n3", "D:\\docs\\ok.txt")];
+        a.deliver_scan(pipeline::ScanResult { added, updated: vec![], removed: vec![], run: Default::default() });
+        let ids: Vec<&str> = a.lib.docs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["have", "n3"]);
+    }
+
+    /// A scan whose thread ended without a result (it crashed) isn't shown as running forever.
+    #[test]
+    fn scan_that_ends_without_a_result_is_not_left_running() {
+        let mut a = app();
+        let (tx, rx) = channel::<Msg>();
+        drop(tx);
+        a.pipe.rx = Some(rx);
+        a.poll_scan();
+        assert!(a.pipe.rx.is_none(), "no longer 'collecting'");
+        assert!(a.settings.runs.first().is_some_and(|r| !r.errors.is_empty()), "the run is recorded as failed");
     }
 }

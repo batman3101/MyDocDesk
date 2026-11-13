@@ -34,6 +34,12 @@ open = "5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = "0.30"
+# API keys and the remembered sync password go to the macOS Keychain
+keyring = { version = "=3.6.3", features = ["apple-native"] }
+
+[target.'cfg(windows)'.dependencies]
+# ... and to the Windows Credential Manager
+keyring = { version = "=3.6.3", features = ["windows-native"] }
 
 [profile.release]
 opt-level = 3
@@ -50,3 +56,7 @@ name = "MyDocDesk"
 identifier = "local.mydocdesk.app"
 short_description = "개인 문서 AI 데스크"
 category = "Productivity"
+
+[dev-dependencies]
+# E2E: 실제 DeskApp 을 화면 없이 띄워 버튼을 찾고 누르는 테스트 (egui 와 같은 0.31.1 로 고정)
+egui_kittest = { version = "=0.31.1", features = ["eframe"] }
