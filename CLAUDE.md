@@ -17,18 +17,32 @@ Rust + eframe/egui 0.31 단일 바이너리. 기본은 **로컬 전용**으로 �
 ```bash
 cargo build                         # 디버그 빌드 → target/debug/mydocdesk(.exe)
 cargo build --release
-cargo test                          # 단위 + E2E 테스트 (현재 69개 통과, 5개 ignored)
+cargo test                          # 단위 + E2E 테스트 (현재 72개 통과, 5개 ignored)
 cargo test -- --test-threads=1      # 순서 의존이 없는지 확인 (병렬·직렬 둘 다 통과해야 함)
 cargo test e2e                      # E2E 테스트만
 cargo test sync::tests              # 모듈 하나만
 cargo test two_devices_share_one_account   # 테스트 하나만 (이름 일부로 필터)
-cargo bundle --release              # cargo-bundle: macOS .app / Windows .msi
+cargo bundle --release              # cargo-bundle: macOS .app (Mac 에서)
 
 # 실제 AI(구독 CLI·로컬 AI)·실제 OS 비밀 저장소를 쓰는 라이브 테스트 — 구독 사용량을 조금 쓴다
 MDD_LIVE=1 cargo test live_ -- --ignored --nocapture
 #   live_document_cannot_make_the_tool_read_files : 문서 속 지시로 구독 CLI 가 파일을 읽지 못하는지
 #   live_os_secret_store_round_trip               : 자격 증명 관리자/키체인 쓰기·읽기·삭제 (흔적 안 남김)
 ```
+
+### Windows 설치 파일 (`app/packaging/windows/`)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build-installer.ps1   # → dist\MyDocDesk-Setup-<버전>.exe
+powershell -ExecutionPolicy Bypass -File packaging\windows\test-installer.ps1    # 설치 E2E 만 다시
+```
+
+- Inno Setup 6(`MyDocDesk.iss`). 빌드 스크립트가 `cargo test` → `cargo build --release` → ISCC → **설치 E2E**(`test-installer.ps1`: 임시 폴더에 조용히 설치 → exe 버전·아이콘·시작 메뉴·앱 목록 확인 → 설치된 exe 를 스크린샷 모드로 실행 → 제거 → 사용자 데이터 그대로인지)를 한다. 설치 관련 변경은 이 E2E 통과까지가 완료다.
+- 이미 설치된 PC 에서는 E2E 가 멈춘다(진짜 설치를 덮어쓰고 지우지 않도록). 먼저 제거하고 돌린다.
+- 버전은 `Cargo.toml` 의 `version` 하나뿐 — `.iss` 에 버전을 적지 않는다(`/DAppVersion` 으로 받음). `AppId` GUID 는 **절대 바꾸지 않는다**(바꾸면 업데이트가 별개 앱으로 깔림). 제거기는 `%APPDATA%\MyDocDesk` 를 지우지 않는다. 이 규칙들은 `main.rs` 의 `packaging_tests` 가 지킨다.
+- 관리자 권한 없이 사용자 단위 설치(`PrivilegesRequired=lowest`). 코드 서명 없음 → SmartScreen 경고가 뜬다.
+- `.cargo/config.toml` 이 MSVC C 런타임을 정적 링크한다(VC++ 재배포 패키지 없는 PC 에서도 실행). `build.rs`(winresource)가 `assets/icon.ico`·버전 정보를 exe 에 넣고, 창 아이콘은 `main.rs` 의 `app_icon()`(`assets/icon.png`).
+- 아이콘을 바꾸려면 `python packaging/make_icon.py`(표준 라이브러리만 사용)를 고쳐 다시 만든다.
 
 ### 스크린샷 모드 (화면 확인용, 필수 기능)
 

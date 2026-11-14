@@ -74,8 +74,25 @@ AI 없이도 문서 보관·검색은 됩니다. 답변을 만들 때만 아래 
 cd app
 cargo run --release          # 실행
 cargo test                   # 테스트
-cargo bundle --release       # 설치 파일 만들기 (cargo-bundle 필요: macOS .app / Windows .msi)
+cargo bundle --release       # macOS .app 만들기 (cargo-bundle 필요, Mac 에서)
 ```
+
+### Windows 설치 파일
+
+[Inno Setup 6](https://jrsoftware.org/isinfo.php) 이 필요합니다 (`winget install --id JRSoftware.InnoSetup -e --scope user`).
+
+```powershell
+cd app
+powershell -ExecutionPolicy Bypass -File packaging\windows\build-installer.ps1
+# → app\dist\MyDocDesk-Setup-<버전>.exe
+```
+
+테스트 → 릴리스 빌드 → 설치 파일 생성 → 설치 E2E(임시 폴더에 설치·실행·제거)를 차례로 하고, 하나라도 실패하면 멈춥니다.
+버전은 `app/Cargo.toml` 의 `version` 한 곳에서만 가져옵니다.
+
+- 관리자 권한 없이 현재 사용자에게 설치됩니다 (`%LOCALAPPDATA%\Programs\MyDocDesk`). 시작 메뉴에 등록되고, 바탕 화면 아이콘은 선택입니다.
+- 제거해도 문서·설정·잠금 번호(`%APPDATA%\MyDocDesk\`)는 지우지 않습니다. 다시 설치하면 그대로 이어서 씁니다.
+- 코드 서명이 없어서 처음 실행할 때 Windows SmartScreen 경고("Windows의 PC 보호")가 나올 수 있습니다. **추가 정보 → 실행** 을 누르면 됩니다.
 
 한글 글꼴은 시스템에 설치된 것(Noto Sans KR → 맑은 고딕 → Apple SD Gothic Neo 순)을 씁니다.
 

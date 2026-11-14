@@ -1,0 +1,4 @@
+# Link the C runtime into the .exe so it starts on a PC without the Visual C++ runtime installed
+# (the installer ships only MyDocDesk.exe). Guarded by packaging_tests in main.rs.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
